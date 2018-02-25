@@ -197,7 +197,7 @@ class InMemoryChannelLayer(BaseChannelLayer):
     In-memory channel layer implementation
     """
     PURGE_INTERVAL = 10 # [seconds]
-    TimedMessage = namedtuple('Message', ['created', 'message'])
+    TimedMessage = namedtuple('TimedMessage', ['created', 'message'])
 
     def __init__(
         self,
