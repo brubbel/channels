@@ -7,6 +7,7 @@ import re
 import string
 import time
 from copy import deepcopy
+from collections import namedtuple
 
 from django.conf import settings
 from django.core.signals import setting_changed
@@ -195,8 +196,8 @@ class InMemoryChannelLayer(BaseChannelLayer):
     """
     In-memory channel layer implementation
     """
-
-    local_poll_interval = 0.01
+    PURGE_INTERVAL = 10 # [seconds]
+    TimedMessage = namedtuple('Message', ['created', 'message'])
 
     def __init__(
         self,
@@ -215,6 +216,7 @@ class InMemoryChannelLayer(BaseChannelLayer):
         self.channels = {}
         self.groups = {}
         self.group_expiry = group_expiry
+        self._last_purge = 0 # time since last purge cycle (epoch)
 
     ### Channel layer API ###
 
@@ -236,7 +238,11 @@ class InMemoryChannelLayer(BaseChannelLayer):
             raise ChannelFull(channel)
 
         # Add message
-        await queue.put((time.time() + self.expiry, deepcopy(message)))
+        timedMessage = InMemoryChannelLayer.TimedMessage(
+            created = time.time(),
+            message = deepcopy(message)
+        )
+        await queue.put(timedMessage)
 
     async def receive(self, channel):
         """
@@ -245,18 +251,14 @@ class InMemoryChannelLayer(BaseChannelLayer):
         of the waiting coroutines will get the result.
         """
         assert self.valid_channel_name(channel)
-        self._clean_expired()
+        await self._purge_expired()
 
         queue = self.channels.setdefault(channel, asyncio.Queue())
 
         # Do a plain direct receive
-        _, message = await queue.get()
+        timedMessage = await queue.get()
 
-        # Delete if empty
-        if queue.empty():
-            del self.channels[channel]
-
-        return message
+        return timedMessage.message
 
     async def new_channel(self, prefix="specific."):
         """
@@ -270,36 +272,42 @@ class InMemoryChannelLayer(BaseChannelLayer):
 
     ### Expire cleanup ###
 
-    def _clean_expired(self):
+    async def _purge_expired(self):
         """
         Goes through all messages and groups and removes those that are expired.
         Any channel with an expired message is removed from all groups.
         """
+        # Throttle.
+        # abs(): system clock on RPI can be adjusted in any direction during runtime.
+        now = time.time()
+        if abs(now - self._last_purge) < InMemoryChannelLayer.PURGE_INTERVAL:
+            return
+        self._last_purge = now
+
         # Channel cleanup
-        for channel, queue in list(self.channels.items()):
-            remove = False
-            # See if it's expired
-            while not queue.empty() and queue._queue[0][0] < time.time():
-                queue.get_nowait()
-                remove = True
-            # Any removal prompts group discard
-            if remove:
-                self._remove_from_groups(channel)
-            # Is the channel now empty and needs deleting?
-            if not queue:
-                del self.channels[channel]
+        # print(len(self.channels)) # Check if InMemoryChannelLayer leaks orphan channels.
+        expired_channels = set()
+        for channel, queue in self.channels.items():
+            if queue.empty():
+                continue
+            elif abs(now - queue._queue[0].created) > self.expiry:
+                expired_channels.add(channel)
 
         # Group Expiration
-        timeout = int(time.time()) - self.group_expiry
+        orphan_channels = set(self.channels.keys())
         for group in self.groups:
             for channel in list(self.groups.get(group, set())):
-                # If join time is older than group_expiry end the group membership
-                if (
-                    self.groups[group][channel]
-                    and int(self.groups[group][channel]) < timeout
-                ):
-                    # Delete from group
+                if channel in expired_channels:
                     del self.groups[group][channel]
+                # If join time is older than group_expiry end the group membership
+                elif abs(now - self.groups[group][channel]) > self.group_expiry:
+                    del self.groups[group][channel]
+                else: # Channel is still active.
+                    orphan_channels.remove(channel)
+
+        # Remove orphaned channels
+        for channel in orphan_channels:
+            self.channels.pop(channel, None)
 
     ### Flush extension ###
 
@@ -310,14 +318,6 @@ class InMemoryChannelLayer(BaseChannelLayer):
     async def close(self):
         # Nothing to go
         pass
-
-    def _remove_from_groups(self, channel):
-        """
-        Removes a channel from all groups. Used when a message on it expires.
-        """
-        for channels in self.groups.values():
-            if channel in channels:
-                del channels[channel]
 
     ### Groups extension ###
 
@@ -348,7 +348,7 @@ class InMemoryChannelLayer(BaseChannelLayer):
         assert isinstance(message, dict), "Message is not a dict"
         assert self.valid_group_name(group), "Invalid group name"
         # Run clean
-        self._clean_expired()
+        await self._purge_expired()
         # Send to each channel
         for channel in self.groups.get(group, set()):
             try:
