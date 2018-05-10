@@ -43,7 +43,9 @@ async def await_many_dispatch(consumer_callables, dispatch):
     try:
         while True:
             # Wait for any of them to complete
-            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED, timeout=0.1)
+            if not done:
+                await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             # Find the completed one(s), yield results, and replace them
             for i, task in enumerate(tasks):
                 if task.done():
