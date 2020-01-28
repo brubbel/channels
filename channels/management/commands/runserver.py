@@ -103,6 +103,8 @@ class Command(RunserverCommand):
                 signal_handlers=not options["use_reloader"],
                 action_logger=self.log_action,
                 http_timeout=self.http_timeout,
+                ping_interval=0,
+                ping_timeout=0,
                 root_path=getattr(settings, "FORCE_SCRIPT_NAME", "") or "",
                 websocket_handshake_timeout=self.websocket_handshake_timeout,
             ).run()
